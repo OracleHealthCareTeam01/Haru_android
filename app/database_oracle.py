@@ -1,45 +1,54 @@
-# app/database_oracle.py
 import os
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
 from sqlalchemy.orm import sessionmaker
-from .config import settings
 
-# TNS/Thick 관련 환경변수 제거(이 프로세스 한정)
-for var in ("TNS_ADMIN", "ORACLE_HOME"):
-    os.environ.pop(var, None)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-def _oracle_url() -> URL:
-    if settings.oracle_service:
-        query = {"service_name": settings.oracle_service}
-    elif settings.oracle_sid:
-        query = {"sid": settings.oracle_sid}
-    else:
-        raise RuntimeError("Set ORACLE_SERVICE or ORACLE_SID in .env")
+ORACLE_USER = os.getenv("ORACLE_USER", "EDUORA001")
+ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "")
+ORACLE_HOST = os.getenv("ORACLE_HOST", "localhost")
+ORACLE_PORT = os.getenv("ORACLE_PORT", "1521")
 
-    return URL.create(
-        drivername="oracle+oracledb",  # Thin 모드 (init_oracle_client 호출 금지)
-        username=settings.oracle_user,
-        password=settings.oracle_password,
-        host=settings.oracle_host,
-        port=settings.oracle_port,
-        query=query,
-    )
+ORACLE_SERVICE = os.getenv("ORACLE_SERVICE", os.getenv("ORACLE_SID", "free"))
 
-engine = create_engine(_oracle_url(), pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+DB_URL = (
+    f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}"
+    f"@{ORACLE_HOST}:{ORACLE_PORT}/?service_name={ORACLE_SERVICE}"
+)
+
+_safe = DB_URL.replace(ORACLE_PASSWORD, "****") if ORACLE_PASSWORD else DB_URL
+print(f"[DB URL(check)] { _safe }")
+
+engine = create_engine(
+    DB_URL,
+    thick_mode=False,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=5,
+    max_overflow=5,
+)
+
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 def get_db():
     db = SessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
-def ping_db() -> bool:
+def ping_db() -> dict:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1 FROM DUAL"))
-        return True
-    except Exception:
-        return False
+        return {"db": "ok"}
+    except Exception as e:
+        return {"db": "fail", "error": str(e)}
