@@ -4,3 +4,4 @@ __pycache__/
 *.db
 uploads/
 .env
+.idea/
