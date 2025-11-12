@@ -5,7 +5,8 @@ from .database_oracle import ping_db
 try:
     from .router import cognitive
     HAS_COG = True
-except Exception:
+except Exception as e:
+    print(f"Cognitive router import 실패: {e}")
     HAS_COG = False
 
 app = FastAPI(title="HaruCoach API")
