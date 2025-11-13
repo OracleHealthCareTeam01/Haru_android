@@ -18,7 +18,6 @@ class UserOut(BaseModel):
 
 # ---------- Today ----------
 class TodayCreate(BaseModel):
-    user_id: int
     entry_date: date
     mood_code: Optional[str] = None
     content: str

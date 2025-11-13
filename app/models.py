@@ -77,15 +77,15 @@ class AppUser(Base):
 # ========== TODAY ==========
 class Today(Base):
     __tablename__ = "TODAY"
-    entry_id   = Column(Integer, Identity(start=1, increment=1), primary_key=True)
-    user_id    = Column(Integer, ForeignKey("APP_USER.USER_ID"), nullable=False)
-    entry_date = Column(Date, nullable=False)
-    mood_code  = Column(String(50))
-    content    = Column(Text, nullable=False)  # CLOB
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    entry_id   = Column("ENTRY_ID",Integer, Identity(start=1, increment=1), primary_key=True)
+    user_id    = Column("USER_ID",Integer, ForeignKey("APP_USER.USER_ID"), nullable=False)
+    entry_date = Column("ENTRY_DATE",Date, nullable=False)
+    mood_code  = Column("MOOD_CODE",String(16))
+    content    = Column("CONTENT",Text, nullable=False)  # CLOB
+    created_at = Column("CREATED_AT",DateTime, nullable=False, default=datetime.utcnow)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "entry_date", name="UQ_TODAY_USER_DATE"),
+        UniqueConstraint("USER_ID", "ENTRY_DATE", name="UQ_TODAY_USER_DATE"),
     )
 
     user = relationship("AppUser", back_populates="todays")
