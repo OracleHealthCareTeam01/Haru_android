@@ -14,6 +14,8 @@ python-dotenv==1.0.1
 pydantic==2.7.0
 pydantic-settings==2.2.1
 python_multipart==0.0.20
+langchain-openai
+langchain-core
 
 # --- Optional: 개발 편의성 ---
 requests==2.32.3
