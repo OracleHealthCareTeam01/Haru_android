@@ -56,7 +56,7 @@ def _select_question_ids_with_select_ai(
 
     # 1) 이 세션에서 사용할 AI 프로필 설정 (환경에 맞게 프로필 이름 조정 가능)
     try:
-        db.execute(text("BEGIN DBMS_CLOUD_AI.SET_PROFILE('COGNITIVE_AI'); END;"))
+        db.execute(text("BEGIN DBMS_CLOUD_AI.SET_PROFILE('QUIZ_AI'); END;"))
     except Exception as e:
         logger.error(f"[SELECT AI] SET_PROFILE 실패: {e}", exc_info=True)
         raise
