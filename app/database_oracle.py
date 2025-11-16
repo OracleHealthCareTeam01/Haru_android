@@ -15,17 +15,15 @@ ORACLE_USER = os.getenv("ORACLE_USER")
 ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
 
 # tnsnames.ora 안에 있는 alias (team003_medium)
-ORACLE_DSN = os.getenv("ORACLE_DSN", "team003_medium")
+ORACLE_DSN = os.getenv("ORACLE_DSN")
 
 # Instant Client & Wallet 경로
 ORACLE_INSTANT_CLIENT = os.getenv(
-    "ORACLE_INSTANT_CLIENT",
-    "/Users/junwookang/Desktop/instantclient",
+    "ORACLE_INSTANT_CLIENT"
 )
 
 ORACLE_WALLET_DIR = os.getenv(
-    "ORACLE_WALLET_DIR",
-    "/Users/junwookang/Desktop/Wallet_team003",
+    "ORACLE_WALLET_DIR"
 )
 
 # ------------------ Thick 모드 초기화 (한 번만!) ------------------
