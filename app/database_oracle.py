@@ -11,8 +11,8 @@ except Exception:
     pass
 
 # ------------------ 환경 변수 읽기 ------------------
-ORACLE_USER = os.getenv("ORACLE_USER", "ADMIN")
-ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "")
+ORACLE_USER = os.getenv("ORACLE_USER")
+ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
 
 # tnsnames.ora 안에 있는 alias (team003_medium)
 ORACLE_DSN = os.getenv("ORACLE_DSN", "team003_medium")
@@ -20,12 +20,12 @@ ORACLE_DSN = os.getenv("ORACLE_DSN", "team003_medium")
 # Instant Client & Wallet 경로
 ORACLE_INSTANT_CLIENT = os.getenv(
     "ORACLE_INSTANT_CLIENT",
-    "/Users/choiminhee/Desktop/oracle/instantclient_23",
+    "/Users/junwookang/Desktop/instantclient",
 )
 
 ORACLE_WALLET_DIR = os.getenv(
     "ORACLE_WALLET_DIR",
-    "/Users/choiminhee/Desktop/wallet/Wallet_team003",
+    "/Users/junwookang/Desktop/Wallet_team003",
 )
 
 # ------------------ Thick 모드 초기화 (한 번만!) ------------------

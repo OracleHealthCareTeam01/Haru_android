@@ -14,6 +14,7 @@ from ..database_oracle import get_db
 from ..schemas_cognitive import (
     Question, StartResponse, AnswerItem, SubmitRequest, Result
 )
+from ..services.quiz_scoring import choose_scoring
 
 # ----------------------------------------------------------------------
 # 로깅 설정하기
@@ -405,98 +406,283 @@ def start_cognitive(
         raise HTTPException(status_code=500, detail=f"질문 조회/빈 답안 생성 오류: {e}")
 
 
-# ---------------- SUBMIT 엔드포인트 (ORM 방식) ----------------
+
 @router.post("/submit", response_model=Result)
 def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
     """
-    클라이언트에서 보낸 답안을 저장하고 채점한 뒤 결과를 반환합니다.
-    models.py의 ORM 클래스를 사용합니다.
+    클라이언트에서 보낸 답안을 채점하고 저장합니다.
+
+    프로세스:
+    1. /start에서 생성된 빈 COGNITIVE_ANSWER 레코드를 찾음
+    2. AI 채점 수행 (choose_scoring)
+    3. STT_TEXT가 있으면 임베딩 벡터 생성
+    4. UPDATE: score, latency_ms, stt_text, voice_vector
+    5. 세션 완료 처리
+
+    Oracle 23ai/26ai Vector 기능 활용:
+    - STT_TEXT를 OpenAI Embeddings API로 벡터화
+    - VOICE_VECTOR 컬럼에 저장 (1536차원 벡터)
     """
 
-    # 0) 유효성 검사: answers가 비어있으면 오류
+    # ========== 0) 유효성 검사 ==========
     if not payload.answers:
         raise HTTPException(status_code=400, detail="answers가 비어 있습니다.")
 
-    # 1) 정답 사전 조회: {questionId: answer_text}
-    qids = [a.questionId for a in payload.answers if a.questionId]
-    answer_map: Dict[int, str] = {}
-    if qids:
-        try:
-            rows = (
-                db.query(CognitiveQuestion.question_id, CognitiveQuestion.answer)
-                .filter(CognitiveQuestion.question_id.in_(qids))
-                .all()
-            )
-            answer_map = {int(r[0]): str(r[1] or "") for r in rows}
-        except Exception:
-            # 정답 조회 실패 시 빈 맵으로 처리 (해당 문제는 0점)
-            answer_map = {}
+    logger.info(f"[제출 시작] 세션 ID: {payload.sessionId}, 답변 수: {len(payload.answers)}")
 
-    # 2) 각 문항 점수 계산 및 CognitiveAnswer에 저장
-    per_q_score: Dict[int, float] = {}
-    total = 0.0
-
+    # ========== 1) 세션 존재 여부 확인 ==========
     try:
-        for item in payload.answers:
-            expected = answer_map.get(item.questionId, "")
-            user_text = item.sttText or item.typedText or ""
-            hit = 1.0 if _norm(user_text) == _norm(expected) and expected != "" else 0.0
-
-            ans = CognitiveAnswer(
-                session_id=payload.sessionId,
-                question_no=item.questionNo,
-                question_id=item.questionId if item.questionId else None,
-                stt_text=item.sttText,
-                typed_text=item.typedText,
-                score=hit * 100.0,  # 0 또는 100
-                latency_ms=item.latencyMs,
-                created_at=datetime.utcnow(),
-            )
-
-            db.add(ans)
-
-            per_q_score[item.questionNo] = hit * 100.0
-            total += hit * 100.0
-
-        db.commit()
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"답안 저장 오류: {e}")
-
-    # 3) 세션 종료 및 총점 업데이트
-    try:
-        n = len(payload.answers)
-        avg = total / n if n else 0.0
-
         session_obj = (
             db.query(CognitiveSession)
             .filter(CognitiveSession.session_id == payload.sessionId)
             .one_or_none()
         )
         if not session_obj:
-            raise HTTPException(
-                status_code=400, detail="유효하지 않은 sessionId 입니다."
-            )
+            raise HTTPException(status_code=400, detail="유효하지 않은 sessionId입니다.")
 
-        session_obj.finished_at = datetime.utcnow()
-        session_obj.total_score = avg
-        session_obj.status = "COMPLETED"
-
-        db.commit()
+        logger.info(f"[세션 확인] 세션 {payload.sessionId} 존재 확인 완료")
 
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"[세션 조회 오류] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"세션 조회 오류: {e}")
+
+    # ========== 2) 문항 정보 로드 ==========
+    qids = [a.questionId for a in payload.answers if a.questionId]
+    question_map: Dict[int, CognitiveQuestion] = {}
+
+    if qids:
+        try:
+            rows: List[CognitiveQuestion] = (
+                db.query(CognitiveQuestion)
+                .filter(CognitiveQuestion.question_id.in_(qids))
+                .all()
+            )
+            question_map = {int(r.question_id): r for r in rows}
+            logger.info(f"[문항 조회] {len(question_map)}개 문항 정보 로드 완료")
+
+        except Exception as e:
+            logger.error(f"[문항 조회 오류] {e}", exc_info=True)
+            question_map = {}
+
+    # ========== 3) 각 문항 채점 및 벡터 생성 후 UPDATE ==========
+    per_q_score: Dict[int, float] = {}
+    total_score = 0.0
+    vector_success_count = 0
+    vector_fail_count = 0
+
+    # 새로 추가: 카테고리별 합계 및 카운트
+    category_sum: Dict[str, float] = {}
+    category_count: Dict[str, int] = {}
+
+    try:
+        for idx, item in enumerate(payload.answers, 1):
+            logger.info(f"[처리 {idx}/{len(payload.answers)}] Q{item.questionNo} 시작")
+
+            # 사용자 답변 추출 (STT 우선)
+            user_text = item.sttText or item.typedText or ""
+
+            # 문항 정보 가져오기
+            qinfo = question_map.get(item.questionId) if item.questionId else None
+
+            # ========== AI 채점 수행 ==========
+            if qinfo:
+                try:
+                    score_0_1, feedback, resolved_correct = choose_scoring(
+                        category=qinfo.category or "",
+                        text=qinfo.text or "",
+                        correct_answer_raw=qinfo.answer or "",
+                        user_answer=user_text,
+                    )
+                    logger.info(
+                        f"[AI 채점] Q{item.questionNo}: 점수={score_0_1:.2f}"
+                    )
+                except Exception as e:
+                    logger.error(f"[AI 채점 오류] Q{item.questionNo}: {e}", exc_info=True)
+                    score_0_1 = 0.0
+                    feedback = f"AI 채점 오류: {str(e)}"
+                    resolved_correct = ""
+            else:
+                score_0_1 = 0.0
+                feedback = "문항 정보 없음"
+                resolved_correct = ""
+                logger.warning(f"[문항 누락] Q{item.questionNo}")
+
+            score_pct = score_0_1 * 100.0
+
+            # ===== 카테고리 집계 시작 =====
+            qinfo = question_map.get(item.questionId) if item.questionId else None
+            category_name = (qinfo.category.strip() if qinfo and qinfo.category else "UNKNOWN")
+
+            # 안전하게 카테고리 키 초기화
+            if category_name not in category_sum:
+                category_sum[category_name] = 0.0
+                category_count[category_name] = 0
+
+            category_sum[category_name] += score_pct
+            category_count[category_name] += 1
+            # ===== 카테고리 집계 끝 =====
+
+            # ========== 임베딩 벡터 생성 (STT_TEXT가 있을 때만) ==========
+            # vector_str = None
+            # if item.sttText and item.sttText.strip():
+            #     try:
+            #         logger.info(f"[벡터 생성] Q{item.questionNo} STT_TEXT 임베딩 시작...")
+            #         embedding = generate_text_embedding(item.sttText)
+            #
+            #         if embedding:
+            #             vector_str = format_vector_for_oracle(embedding)
+            #             vector_success_count += 1
+            #             logger.info(
+            #                 f"[벡터 생성 완료] Q{item.questionNo}: "
+            #                 f"차원={len(embedding)}, 크기={len(vector_str)} bytes"
+            #             )
+            #         else:
+            #             vector_fail_count += 1
+            #             logger.warning(f"[벡터 생성 실패] Q{item.questionNo}: 임베딩 반환값 없음")
+            #
+            #     except Exception as e:
+            #         vector_fail_count += 1
+            #         logger.error(f"[벡터 생성 오류] Q{item.questionNo}: {e}", exc_info=True)
+            # else:
+            #     logger.info(f"[벡터 건너뜀] Q{item.questionNo}: STT_TEXT 없음")
+
+            # ========== DB UPDATE 수행 ==========
+            existing = (
+                db.query(CognitiveAnswer)
+                .filter(
+                    CognitiveAnswer.session_id == payload.sessionId,
+                    CognitiveAnswer.question_no == item.questionNo,
+                )
+                .one_or_none()
+            )
+
+            if existing:
+                # ★ 기존 레코드 UPDATE
+                existing.question_id = item.questionId if item.questionId else existing.question_id
+                existing.stt_text = item.sttText
+                existing.typed_text = item.typedText  # 타이핑 답변도 함께 저장
+                existing.score = round(score_pct, 2)
+                existing.latency_ms = item.latencyMs
+                existing.created_at = existing.created_at or datetime.utcnow()
+
+                # ★ Vector 값 업데이트 (Oracle VECTOR 컬럼에 문자열로 저장)
+                # if vector_str:
+                #     # Oracle Vector는 문자열 형식으로 저장: '[1.0, 2.0, ...]'
+                #     existing.voice_vector = vector_str
+
+                logger.info(
+                    f"[UPDATE 완료] Q{item.questionNo} "
+                    # f"(answer_id={existing.answer_id}, 벡터={'O' if vector_str else 'X'})"
+                )
+            else:
+                # ★ placeholder 없으면 새로 INSERT (안전장치)
+                logger.warning(f"[INSERT] Q{item.questionNo} placeholder 없음 - 새로 생성")
+
+                ans = CognitiveAnswer(
+                    session_id=payload.sessionId,
+                    question_no=item.questionNo,
+                    question_id=item.questionId if item.questionId else None,
+                    stt_text=item.sttText,
+                    typed_text=item.typedText,
+                    score=round(score_pct, 2),
+                    latency_ms=item.latencyMs,
+                    # voice_vector=vector_str,  # 벡터 저장
+                    created_at=datetime.utcnow(),
+                )
+                db.add(ans)
+
+            # 점수 집계
+            per_q_score[item.questionNo] = round(score_pct, 2)
+            total_score += score_pct
+
+        # ========== 모든 답변 커밋 ==========
+        db.commit()
+
+        logger.info(
+            f"[답변 저장 완료] 세션 {payload.sessionId}: "
+            f"{len(payload.answers)}개 답변 저장 완료 "
+            f"(벡터 성공: {vector_success_count}, 실패: {vector_fail_count})"
+        )
+
+    except Exception as e:
         db.rollback()
+        logger.error(f"[답변 저장 오류] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"답안 저장 오류: {e}")
+
+    # ========== 4) 세션 종료 및 총점 업데이트 ==========
+    try:
+        n = len(payload.answers)
+        avg_score = total_score / n if n > 0 else 0.0
+
+        session_obj.finished_at = datetime.utcnow()
+        session_obj.total_score = round(avg_score, 2)
+        session_obj.status = "COMPLETED"
+
+        db.commit()
+
+        logger.info(
+            f"[세션 완료] 세션 {payload.sessionId}: "
+            f"평균 {avg_score:.2f}점, 상태 COMPLETED"
+        )
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[세션 업데이트 오류] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"세션 업데이트 오류: {e}")
 
-    grade = _grade_from(avg)
-    summary = f"총 {len(payload.answers)}문항 평균 {avg:.1f}점 → 등급 {grade}"
+    # ========== 5) 결과 반환 (기본 구조) ==========
+    grade = _grade_from(avg_score)
+    summary = f"총 {len(payload.answers)}문항 평균 {avg_score:.1f}점 → 등급 {grade}"
 
+    category_average: Dict[str, float] = {}
+    for cat, s in category_sum.items():
+        cnt = category_count.get(cat, 0)
+        category_average[cat] = round((s / cnt) if cnt > 0 else 0.0, 2)
+
+    # ========== 최근 3회 세션 반환 ==========
+    recent_sessions_list = []
+    try:
+        if getattr(session_obj, "user_id", None) is not None:
+            rows = (
+                db.query(CognitiveSession)
+                .filter(
+                    CognitiveSession.user_id == session_obj.user_id,
+                    CognitiveSession.status == "COMPLETED",
+                )
+                .order_by(CognitiveSession.finished_at.desc())
+                .limit(3)
+                .all()
+            )
+        else:
+            # fallback: 같은 세션 소유자 정보가 없으면, 전체에서 최근 3개(조심해서 사용)
+            rows = (
+                db.query(CognitiveSession)
+                .filter(CognitiveSession.status == "COMPLETED")
+                .order_by(CognitiveSession.finished_at.desc())
+                .limit(3)
+                .all()
+            )
+
+        for r in rows:
+            recent_sessions_list.append({
+                "sessionId": int(r.session_id),
+                "finishedAt": r.finished_at.isoformat() if r.finished_at else None,
+                "totalScore": float(r.total_score) if getattr(r, "total_score", None) is not None else None
+            })
+
+    except Exception as e:
+        logger.warning(f"[최근 세션 조회 실패] {e}", exc_info=True)
+        recent_sessions_list = []
+
+    logger.info(f"[제출 완료] {summary}")
+
+    # 최종 반환
     return Result(
-        totalScore=round(avg, 1),
-        perQuestion=per_q_score,
+        totalScore=round(avg_score, 1),
+        categoryAverage=category_average,
+        recentSessions=recent_sessions_list,
         summary=summary,
         grade=grade,
     )

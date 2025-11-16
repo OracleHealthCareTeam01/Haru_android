@@ -4,7 +4,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select
-from datetime import date
+import datetime
 
 from ..models import Today
 from ..schemas import  TodayCreate, TodayOut
@@ -77,25 +77,26 @@ async def get_diary_list(
 # 2. 일기 등록 API
 # ============================================
 @router.post("/create", response_model=TodayOut, status_code=201)
-async def create_diary(
+async def create_or_update_diary(
         diary_data: TodayCreate,
         user_id: int = Query(..., description="사용자 ID"),
         db: Session = Depends(get_db)
 ):
     """
-    새로운 일기를 등록합니다.
+    새로운 일기를 등록하거나 기존 일기를 수정합니다.
 
     Parameters:
     - user_id: 작성자의 사용자 ID (필수)
     - diary_data: 일기 내용 (entry_date, mood_code, content)
 
     Returns:
-    - 생성된 일기 정보
+    - 생성/수정된 일기 정보 (is_updated 플래그 포함)
     """
+    existing_diary, new_diary = None, None
     try:
-        logger.info(f"일기 등록 요청 - user_id: {user_id}, date: {diary_data.entry_date}")
+        logger.info(f"일기 등록/수정 요청 - user_id: {user_id}, date: {diary_data.entry_date}")
 
-        # 같은 날짜에 이미 일기가 있는지 확인 (UQ_TODAY_USER_DATE 제약조건)
+        # 같은 날짜에 이미 일기가 있는지 확인
         stmt = select(Today).where(
             Today.user_id == user_id,
             Today.entry_date == diary_data.entry_date
@@ -103,33 +104,42 @@ async def create_diary(
         existing_diary = db.execute(stmt).scalar_one_or_none()
 
         if existing_diary:
-            logger.warning(f"중복된 일기 - user_id: {user_id}, date: {diary_data.entry_date}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"{diary_data.entry_date} 날짜에 이미 일기가 존재합니다."
+            # 기존 일기 수정
+            logger.info(f"기존 일기 수정 - entry_id: {existing_diary.entry_id}")
+            existing_diary.mood_code = diary_data.mood_code
+            existing_diary.content = diary_data.content
+            existing_diary.modified_date = datetime.utcnow()  # 수정 시간 기록
+
+            db.commit()
+            db.refresh(existing_diary)
+
+            logger.info(f"일기 수정 완료 - entry_id: {existing_diary.entry_id}")
+
+            return existing_diary
+        else:
+            # 새로운 일기 생성
+            logger.info(f"새로운 일기 생성 - user_id: {user_id}, date: {diary_data.entry_date}")
+            new_diary = Today(
+                user_id=user_id,
+                entry_date=diary_data.entry_date,
+                mood_code=diary_data.mood_code,
+                content=diary_data.content,
+                modified_date=None  # 최초 생성 시에는 None
             )
 
-        # 새로운 일기 객체 생성
-        new_diary = Today(
-            user_id=user_id,
-            entry_date=diary_data.entry_date,
-            mood_code=diary_data.mood_code,
-            content=diary_data.content
-        )
+            db.add(new_diary)
+            db.commit()
+            db.refresh(new_diary)
 
-        # 데이터베이스에 추가 및 커밋
-        db.add(new_diary)
-        db.commit()
-        db.refresh(new_diary)  # DB에서 생성된 ID와 created_at 값을 가져옴
+            logger.info(f"일기 등록 완료 - entry_id: {new_diary.entry_id}")
 
-        logger.info(f"일기 등록 완료 - entry_id: {new_diary.entry_id}")
-        return new_diary
+            return new_diary
 
-    except HTTPException:
-        # HTTPException은 그대로 전달
-        raise
+        ## TODO 일기 AI 관련 로직 추가
+        # return *****8
+
     except Exception as e:
-        logger.error(f"일기 등록 중 오류 발생: {str(e)}")
-        db.rollback()  # 오류 발생 시 롤백
-        raise HTTPException(status_code=500, detail="일기 등록 실패")
+        logger.error(f"일기 등록/수정 중 오류 발생: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="일기 등록/수정 실패")
 

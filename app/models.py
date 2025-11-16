@@ -83,12 +83,18 @@ class Today(Base):
     mood_code  = Column("MOOD_CODE",String(16))
     content    = Column("CONTENT",Text, nullable=False)  # CLOB
     created_at = Column("CREATED_AT",DateTime, nullable=False, default=datetime.utcnow)
+    modified_date = Column("MODIFIED_DATE", DateTime, nullable=True)  # 수정 시에만 값이 들어감
 
     __table_args__ = (
         UniqueConstraint("USER_ID", "ENTRY_DATE", name="UQ_TODAY_USER_DATE"),
     )
 
     user = relationship("AppUser", back_populates="todays")
+
+    # is_updated는 DB 컬럼이 아닌 런타임 속성으로 사용
+    @property
+    def is_updated(self):
+        return self.modified_date is not None
 
 
 # ========== COGNITIVE_SESSION ==========
