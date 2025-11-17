@@ -21,3 +21,4 @@ langchain-core
 requests==2.32.3
 
 # .\.venv\Scripts\activate
+# uvicorn app.main:app --reload --port 8000

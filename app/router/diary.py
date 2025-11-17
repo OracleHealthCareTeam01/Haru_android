@@ -139,13 +139,13 @@ async def create_diary(
 async def diary_ai_coach(payload: DiaryAIRequest):
     """
     오늘의 일기 본문을 받아 AI 정신건강 코치의
-    - 요약
-    - 감정 설명 + 공감
-    - 조언
+    1) 요약
+    2) 감정 리포트 (감정/공감/인생 조언)
+    3) 유튜브 영상 추천
     을 반환하는 엔드포인트.
 
-    그리고DB에는 아무 것도 저장하지 않는다.
-    (저장은 /diary/create 로 따로 처리)
+    참골 DB에는 아무 것도 저장하지 않는다.
+       (저장은 /diary/create 로 따로 처리)
     """
     if not payload.content or not payload.content.strip():
         raise HTTPException(status_code=400, detail="content는 비어 있을 수 없습니다.")
@@ -153,7 +153,6 @@ async def diary_ai_coach(payload: DiaryAIRequest):
     try:
         return analyze_diary_with_coach(
             content=payload.content,
-            mood_code=payload.mood_code,
             entry_date=payload.entry_date,
             display_name=payload.display_name,
         )
