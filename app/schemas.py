@@ -29,6 +29,7 @@ class TodayOut(BaseModel):
     mood_code: Optional[str]
     content: str
     created_at: datetime
+    is_updated: bool
     class Config: from_attributes = True
 
 # ---------- Questions ----------

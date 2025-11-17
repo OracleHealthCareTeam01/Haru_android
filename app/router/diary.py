@@ -111,7 +111,7 @@ async def create_or_update_diary(
             logger.info(f"기존 일기 수정 - entry_id: {existing_diary.entry_id}")
             existing_diary.mood_code = diary_data.mood_code
             existing_diary.content = diary_data.content
-            existing_diary.modified_date = datetime.utcnow()  # 수정 시간 기록
+            existing_diary.modified_date = datetime.datetime.utcnow()  # 수정 시간 기록
 
             db.commit()
             db.refresh(existing_diary)
