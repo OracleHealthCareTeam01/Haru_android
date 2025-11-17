@@ -1,10 +1,11 @@
-# app/services/diary_coach.py
 from __future__ import annotations
 
+import os
 import random
 from typing import Optional
 from datetime import date
 
+import requests
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -110,63 +111,72 @@ JSON 이외의 다른 텍스트는 출력하지 마라.
 
 _chain = _PROMPT | _llm.with_structured_output(DiaryCoachResult)
 
-YOUTUBE_POOL = {
-    "명상": [
-        {
-            "title": "잠들기 전 10분 명상",
-            "url": "https://www.youtube.com/watch?v=VIDEO_ID_MEDITATION_1",
-        },
-        {
-            "title": "불안을 가라앉히는 호흡 명상",
-            "url": "https://www.youtube.com/watch?v=VIDEO_ID_MEDITATION_2",
-        },
-    ],
-    "스트레칭": [
-        {
-            "title": "하루 피로를 풀어주는 5분 스트레칭",
-            "url": "https://www.youtube.com/watch?v=VIDEO_ID_STRETCH_1",
-        },
-        {
-            "title": "의자에 앉아서 하는 간단 스트레칭",
-            "url": "https://www.youtube.com/watch?v=VIDEO_ID_STRETCH_2",
-        },
-    ],
-    "운동": [
-        {
-            "title": "집에서 하는 가벼운 홈트 10분",
-            "url": "https://www.youtube.com/watch?v=VIDEO_ID_WORKOUT_1",
-        },
-    ],
-    "힐링": [
-        {
-            "title": "잔잔한 피아노 힐링 음악",
-            "url": "https://www.youtube.com/watch?v=VIDEO_ID_HEALING_1",
-        },
-    ],
-    "동물": [
-        {
-            "title": "귀여운 강아지 힐링 모음",
-            "url": "https://www.youtube.com/watch?v=VIDEO_ID_ANIMAL_1",
-        },
-    ],
-}
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
-
-def _pick_youtube(category: str) -> tuple[str, str]:
+def _search_youtube_top_video(
+    query: str,
+    fallback_category: Optional[str] = None,
+) -> tuple[str, str]:
     """
-    LLM이 고른 카테고리 기준으로, 우리가 준비해 둔 유튜브 목록에서 하나 선택.
-    - category가 없거나 목록이 비어 있으면 기본값 사용.
+    YouTube Data API v3로 검색해서 상위 영상 1개를 가져온다.
+    - query: LLM이 만들어 준 youtube_search_query
+    - fallback_category: 실패 시 사용할 대체 검색어 힌트
+    반환: (title, url)
     """
-    default_title = "편안한 음악 모음"
-    default_url = "https://www.youtube.com/results?search_query=relax+music"
+    # API 키가 없으면 YouTube 검색 대신 기본 검색 URL 반환
+    if not YOUTUBE_API_KEY:
+        # 최소한 "검색 결과 페이지"라도 열리게 만들기
+        q = query or (fallback_category or "relax music")
+        return (
+            "YouTube 검색 결과",
+            f"https://www.youtube.com/results?search_query={q.replace(' ', '+')}",
+        )
 
-    pool = YOUTUBE_POOL.get(category)
-    if not pool:
-        return default_title, default_url
+    if not query:
+        query = fallback_category or "relax music"
 
-    choice = random.choice(pool)
-    return choice["title"], choice["url"]
+    endpoint = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "key": YOUTUBE_API_KEY,
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "maxResults": 1,
+        "order": "relevance",
+        "safeSearch": "strict",
+    }
 
+    try:
+        resp = requests.get(endpoint, params=params, timeout=5)
+        if resp.status_code != 200:
+            q = query.replace(" ", "+")
+            return (
+                "YouTube 검색 결과",
+                f"https://www.youtube.com/results?search_query={q}",
+            )
+
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            q = query.replace(" ", "+")
+            return (
+                "YouTube 검색 결과",
+                f"https://www.youtube.com/results?search_query={q}",
+            )
+
+        top = items[0]
+        video_id = top["id"]["videoId"]
+        title = top["snippet"]["title"]
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        return title, url
+
+    except Exception:
+        q = query.replace(" ", "+")
+        return (
+            "YouTube 검색 결과",
+            f"https://www.youtube.com/results?search_query={q}",
+        )
+        
 def analyze_diary_with_coach(
     content: str,
     entry_date: Optional[date] = None,
@@ -191,14 +201,16 @@ def analyze_diary_with_coach(
 
     result: DiaryCoachResult = _chain.invoke(variables)
 
-    # 감정 리포트 구성
     emotion_report = EmotionReport(
         emotion=result.emotion,
         empathy=result.empathy,
         life_tip=result.life_tip,
     )
 
-    yt_title, yt_url = _pick_youtube(result.youtube_category)
+    yt_title, yt_url = _search_youtube_top_video(
+        query=result.youtube_search_query,
+        fallback_category=result.youtube_category,
+    )
 
     youtube = YoutubeRecommendation(
         title=yt_title,
