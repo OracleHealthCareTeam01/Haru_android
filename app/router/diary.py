@@ -8,7 +8,10 @@ import datetime
 
 from ..models import Today
 from ..schemas import  TodayCreate, TodayOut
-from ..database_oracle import get_db  # 데이터베이스 세션을 가져오는 함수
+from ..database_oracle import get_db
+
+from ..schemas import TodayCreate, TodayOut, DiaryAIRequest, DiaryAIResponse
+from ..services.diary_coach import analyze_diary_with_coach
 
 LOG_FORMAT = "%(levelname)s: [%(asctime)s] - [%(module)s] => %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, stream=sys.stdout)
@@ -135,11 +138,38 @@ async def create_or_update_diary(
 
             return new_diary
 
-        ## TODO 일기 AI 관련 로직 추가
-        # return *****8
-
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"일기 등록/수정 중 오류 발생: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=500, detail="일기 등록/수정 실패")
+
+@router.post("/ai", response_model=DiaryAIResponse)
+async def diary_ai_coach(payload: DiaryAIRequest):
+    """
+    오늘의 일기 본문을 받아 AI 정신건강 코치의
+    1) 요약
+    2) 감정 리포트 (감정/공감/인생 조언)
+    3) 유튜브 영상 추천
+    을 반환하는 엔드포인트.
+
+    참골 DB에는 아무 것도 저장하지 않는다.
+       (저장은 /diary/create 로 따로 처리)
+    """
+    if not payload.content or not payload.content.strip():
+        raise HTTPException(status_code=400, detail="content는 비어 있을 수 없습니다.")
+
+    try:
+        return analyze_diary_with_coach(
+            content=payload.content,
+            entry_date=payload.entry_date,
+            display_name=payload.display_name,
+        )
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="AI 분석 중 오류가 발생했습니다.")
 

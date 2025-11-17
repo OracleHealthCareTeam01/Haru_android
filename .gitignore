@@ -6,3 +6,4 @@ uploads/
 .env
 .idea/
 test.py
+.vscode/
