@@ -4,6 +4,7 @@ import sys
 import json
 from typing import List, Dict, Optional
 from datetime import datetime
+import re
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
@@ -47,21 +48,22 @@ def _select_question_ids_with_select_ai(
     category: Optional[str]
 ) -> List[int]:
     """
-    Oracle 23ai SELECT AI를 사용해서
+    Oracle 23ai DBMS_CLOUD_AI.GENERATE 를 사용해서
     cognitive_question 테이블에 이미 존재하는 문제들 중에서
     questionId 들만 골라오는 함수.
 
-    반환: [questionId1, questionId2, ...] (최대 count개)
+    1차 시도: LLM이 JSON 배열([6,21,3,...])을 직접 반환 → json.loads
+    2차 시도: JSON이 아니면, 설명 텍스트/SQL 안에서 숫자를 regex로 뽑아서 사용
     """
 
-    # 1) 이 세션에서 사용할 AI 프로필 설정 (환경에 맞게 프로필 이름 조정 가능)
+    # 1) 프로필 설정
     try:
         db.execute(text("BEGIN DBMS_CLOUD_AI.SET_PROFILE('QUIZ_AI'); END;"))
     except Exception as e:
         logger.error(f"[SELECT AI] SET_PROFILE 실패: {e}", exc_info=True)
         raise
 
-    # 2) 후보 문제 목록 조회 (기존 cognitive_question에서만!)
+    # 2) 후보 문제 목록 조회
     query = db.query(
         CognitiveQuestion.question_id,
         CognitiveQuestion.category,
@@ -76,8 +78,6 @@ def _select_question_ids_with_select_ai(
     if not candidates:
         raise ValueError("cognitive_question에 사용 가능한 문제가 없습니다.")
 
-    # 후보가 count보다 적으면, 그냥 전부 쓰도록 AI에게 안내하긴 하지만
-    # 최종적으로는 Python에서도 한번 더 방어적으로 처리할 예정
     logger.info(f"[SELECT AI] 후보 문제 개수: {len(candidates)}")
 
     candidates_payload = [
@@ -88,16 +88,23 @@ def _select_question_ids_with_select_ai(
         }
         for row in candidates
     ]
-
     candidates_json = json.dumps(candidates_payload, ensure_ascii=False)
 
-    # 3) 프롬프트 구성
+    # 여기서 미리 candidate_ids 만들어 둔다 (텍스트 파싱 때 필요)
+    candidate_ids = {int(c["questionId"]) for c in candidates_payload}
+
+    # 3) 프롬프트
     prompt = f"""
 당신은 병원에서 사용하는 한국어 인지기능 검사를 설계하는 전문가입니다.
 
-다음은 이미 데이터베이스에 저장되어 있는 인지검사 문제 후보 목록입니다:
+다음은 이미 데이터베이스에 저장되어 있는 인지검사 문제 후보 목록입니다 (JSON 배열):
 
 candidates = {candidates_json}
+
+각 객체는 다음 필드를 가집니다:
+- questionId: 정수형 문제 ID
+- category: 문자열 (지남력, 주의력, 언어능력, 기억력, 회상력 중 하나)
+- text: 문제 내용 (질문 문장)
 
 당신의 역할:
 - 이 후보들 중에서 총 {count}개의 서로 다른 문항을 선택하세요.
@@ -105,38 +112,92 @@ candidates = {candidates_json}
 - 난이도는 전체적으로 중간 수준이 되도록 선택하세요.
 - 같은 문제를 중복해서 선택하지 마세요.
 - 후보에 없는 questionId는 절대 사용하지 마세요.
+- 반드시 정확히 {count}개의 questionId를 선택하세요.
 
-반환 형식:
-- 선택한 문제의 questionId만 담긴 JSON 배열을 반환합니다.
-- 예시: [6, 21, 3, 10]
-- 설명 문장이나 다른 텍스트는 절대 포함하지 마세요.
+출력 형식 (매우 중요):
+
+지금부터 당신의 전체 출력은 오직 하나의 JSON 배열만 포함해야 합니다.
+
+규칙:
+1. 출력은 JSON 배열 하나뿐이어야 합니다.
+2. 배열의 각 원소는 선택한 문제의 questionId 정수입니다.
+3. 배열에 포함되는 값은 모두 candidates 목록 안에 있는 questionId여야 합니다.
+4. 같은 questionId를 중복해서 넣지 마세요.
+5. 배열 길이는 반드시 {count}여야 합니다.
+6. JSON 배열 이외의 어떤 문자, 설명, 줄바꿈 텍스트, 마크다운 코드블록을 절대 출력하지 마세요.
+
+예시 (형식 예시일 뿐, 값과 개수는 실제와 다를 수 있습니다):
+[6, 21, 3, 10]
 """
 
-    # 4) SELECT AI 호출
+    # 4) DBMS_CLOUD_AI.GENERATE 호출
     try:
-        sql = text("SELECT AI NARRATE :prompt")
+        sql = text("""
+            SELECT DBMS_CLOUD_AI.GENERATE(
+                :prompt,
+                'QUIZ_AI',
+                'NARRATE',
+                NULL
+            ) AS response
+            FROM DUAL
+        """)
         raw_response = db.execute(sql, {"prompt": prompt}).scalar()
         logger.info(f"[SELECT AI] raw_response (앞 200자): {str(raw_response)[:200]}...")
     except Exception as e:
-        logger.error(f"[SELECT AI] 호출 실패: {e}", exc_info=True)
+        logger.error(f"[SELECT AI] GENERATE 호출 실패: {e}", exc_info=True)
         raise
 
-    # 5) JSON 파싱
+    if raw_response is None:
+        raise ValueError("SELECT AI(GENERATE)에서 빈 응답이 반환되었습니다.")
+
+    # 5) 1차: JSON 파싱 시도
     try:
         data = json.loads(raw_response)
-    except json.JSONDecodeError as e:
+        if not isinstance(data, list):
+            raise ValueError("JSON이 배열이 아닙니다.")
+        logger.info("[SELECT AI] JSON 배열 파싱 성공")
+    except Exception as e:
+        # 텍스트 안에서 숫자 뽑기
         logger.error(f"[SELECT AI] JSON 파싱 실패: {e} / raw={raw_response}", exc_info=True)
-        raise
+        logger.info("[SELECT AI] JSON이 아니므로 텍스트/SQL에서 questionId 추출 시도")
 
-    if not isinstance(data, list):
-        raise ValueError("SELECT AI 응답이 JSON 배열이 아닙니다. 응답: " + str(data))
+        selected_ids_text: List[int] = []
 
-    # 6) 후보 id 검증 및 클리닝
-    candidate_ids = {int(c["questionId"]) for c in candidates_payload}
+        # 1) IN ( ... ) 패턴 안의 숫자 먼저 노린다.
+        m = re.search(r"IN\s*\(([^)]*)\)", raw_response, re.IGNORECASE | re.DOTALL)
+        sources = []
+        if m:
+            sources.append(m.group(1))
+        else:
+            # 그래도 못 찾으면 전체 텍스트에서 숫자 검색
+            sources.append(raw_response)
+
+        for src in sources:
+            for num_str in re.findall(r"\b\d+\b", src):
+                try:
+                    qid = int(num_str)
+                except ValueError:
+                    continue
+
+                if qid in candidate_ids and qid not in selected_ids_text:
+                    selected_ids_text.append(qid)
+                    logger.info(f"[SELECT AI] 텍스트에서 추출된 questionId: {qid}")
+                    if len(selected_ids_text) >= count:
+                        break
+            if len(selected_ids_text) >= count:
+                break
+
+        if not selected_ids_text:
+            # 텍스트에서도 못 뽑았으면 진짜 실패
+            raise ValueError("SELECT AI(GENERATE) 응답이 JSON 형식도 아니고, 텍스트에서도 questionId를 추출하지 못했습니다.")
+
+        logger.info(f"[SELECT AI] 텍스트에서 추출된 questionId 목록: {selected_ids_text}")
+        data = selected_ids_text  # 아래 공통 로직 타게 함
+
+    # 6) 후보 id 검증 및 정리
     selected_ids: List[int] = []
 
     for idx, item in enumerate(data, start=1):
-        # 리스트 요소가 그냥 숫자인 경우, {"questionId": ...}인 경우 둘 다 허용
         if isinstance(item, dict):
             qid = item.get("questionId")
         else:
@@ -166,16 +227,15 @@ candidates = {candidates_json}
             f"[SELECT AI] 선택된 questionId가 부족합니다. "
             f"선택={len(selected_ids)}, 목표={count}, 후보={len(candidate_ids)}"
         )
-        # 부족한 만큼 남은 후보에서 랜덤으로 채우기
         remaining_ids = list(candidate_ids - set(selected_ids))
         random.shuffle(remaining_ids)
         need = min(count - len(selected_ids), len(remaining_ids))
         selected_ids.extend(remaining_ids[:need])
 
     if not selected_ids:
-        raise ValueError("SELECT AI에서 유효한 questionId를 하나도 선택하지 못했습니다.")
+        raise ValueError("SELECT AI(GENERATE)에서 유효한 questionId를 하나도 선택하지 못했습니다.")
 
-    # 최종적으로 count개까지만 자르기
+    logger.info(f"[SELECT AI] 최종 선택된 questionId 목록: {selected_ids[:count]}")
     return selected_ids[:count]
 
 
@@ -188,11 +248,6 @@ def start_cognitive(
 ):
     """
     인지 능력 검사 시작
-    :param user_id:
-    :param count:
-    :param category:
-    :param db:
-    :return:
     """
     logger.info(
         f"REQ => /start: API 시작. [user_id={user_id}, count={count}, category={category}]"
@@ -229,10 +284,9 @@ def start_cognitive(
     try:
         logger.info(f"[질문 조회] session_id={session_id}의 질문 {count}개 뽑기 시작...")
 
-        # 최종 문제들을 담을 리스트
         question_objects: List[CognitiveQuestion] = []
 
-        # 2-1. 먼저 SELECT AI로 cognitive_question에서 questionId를 고르게 시도
+        # 2-1. 먼저 LLM(GENERATE)로 questionId를 고르게 시도
         selected_ids: List[int] = []
         try:
             logger.info(
@@ -241,16 +295,13 @@ def start_cognitive(
             selected_ids = _select_question_ids_with_select_ai(db, count, category)
             logger.info(f"[SELECT AI] 선택된 questionId 목록: {selected_ids}")
 
-            # 선택된 ID들로 cognitive_question에서 실제 문제 객체들을 가져옴
             if selected_ids:
                 rows = (
                     db.query(CognitiveQuestion)
                     .filter(CognitiveQuestion.question_id.in_(selected_ids))
                     .all()
                 )
-                # id -> 객체 매핑
                 row_map = {int(r.question_id): r for r in rows}
-                # AI가 준 순서를 유지하면서 리스트 만들기
                 for qid in selected_ids:
                     if qid in row_map:
                         question_objects.append(row_map[qid])
@@ -266,7 +317,7 @@ def start_cognitive(
             )
             question_objects = []
 
-        # 2-2. SELECT AI가 실패했거나 0개만 만든 경우: 기존 랜덤 로직 사용
+        # 2-2. LLM이 실패했거나 0개만 만든 경우: 기존 랜덤 로직 사용
         if not question_objects:
             if category:
                 logger.info(
@@ -282,8 +333,6 @@ def start_cognitive(
             else:
                 logger.info(f"[Fallback] 기존 검사 생성 로직 사용 START!")
 
-                # 1. '기억력-회상력' mapping
-                #    (Q6-Q21, Q7-Q22, Q8-Q23, Q9-Q24, Q10-Q25)
                 set_id = random.randint(1, 5)
                 logger.info(
                     f"[Fallback] user_id={user_id} 기억력/회상력 세트 '{set_id}번' 선택"
@@ -304,7 +353,6 @@ def start_cognitive(
                     f"[Fallback] 기억력, 회상력 생성 (Q_ID: {mem_q_id}, {rec_q_id})"
                 )
 
-                # 2. 나머지 문제 (총 count - 2개)
                 remaining_count = count - 2
                 if remaining_count > 0:
                     other_cats = ["지남력", "주의력", "언어능력"]
@@ -346,7 +394,6 @@ def start_cognitive(
         )
 
         for i, q_obj in enumerate(question_objects, start=1):
-            # 응답용 질문 리스트
             questions_for_response.append(
                 Question(
                     questionNo=i,
@@ -358,7 +405,6 @@ def start_cognitive(
                 )
             )
 
-            # DB 저장용 빈 CognitiveAnswer 생성
             new_blank_answer = CognitiveAnswer(
                 session_id=session_id,
                 question_no=i,
@@ -368,7 +414,6 @@ def start_cognitive(
             )
             db.add(new_blank_answer)
 
-        # 질문이 하나도 없으면 더미 질문 (이 경우엔 빈 답안지 저장 안 함)
         if not question_objects:
             logger.warning(
                 f"[질문 백업] user_id={user_id} DB에 질문이 없음! [session_id={session_id}] 더미 질문 반환."
@@ -387,7 +432,6 @@ def start_cognitive(
                 f"[질문 백업] user_id={user_id} {len(question_objects)}개 DB 저장 완료."
             )
 
-        # --- 최종 응답 ---
         logger.info(
             f"RES => user_id={user_id} /start: 성공! [session_id={session_id}] "
             f"질문 {len(questions_for_response)}개 반환."
@@ -406,31 +450,18 @@ def start_cognitive(
         raise HTTPException(status_code=500, detail=f"질문 조회/빈 답안 생성 오류: {e}")
 
 
-
 @router.post("/submit", response_model=Result)
 def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
     """
     클라이언트에서 보낸 답안을 채점하고 저장합니다.
-
-    프로세스:
-    1. /start에서 생성된 빈 COGNITIVE_ANSWER 레코드를 찾음
-    2. AI 채점 수행 (choose_scoring)
-    3. STT_TEXT가 있으면 임베딩 벡터 생성
-    4. UPDATE: score, latency_ms, stt_text, voice_vector
-    5. 세션 완료 처리
-
-    Oracle 23ai/26ai Vector 기능 활용:
-    - STT_TEXT를 OpenAI Embeddings API로 벡터화
-    - VOICE_VECTOR 컬럼에 저장 (1536차원 벡터)
     """
 
-    # ========== 0) 유효성 검사 ==========
     if not payload.answers:
         raise HTTPException(status_code=400, detail="answers가 비어 있습니다.")
 
     logger.info(f"[제출 시작] 세션 ID: {payload.sessionId}, 답변 수: {len(payload.answers)}")
 
-    # ========== 1) 세션 존재 여부 확인 ==========
+    # 1) 세션 확인
     try:
         session_obj = (
             db.query(CognitiveSession)
@@ -448,7 +479,7 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
         logger.error(f"[세션 조회 오류] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"세션 조회 오류: {e}")
 
-    # ========== 2) 문항 정보 로드 ==========
+    # 2) 문항 정보 로드
     qids = [a.questionId for a in payload.answers if a.questionId]
     question_map: Dict[int, CognitiveQuestion] = {}
 
@@ -466,13 +497,12 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
             logger.error(f"[문항 조회 오류] {e}", exc_info=True)
             question_map = {}
 
-    # ========== 3) 각 문항 채점 및 벡터 생성 후 UPDATE ==========
+    # 3) 채점 + 업데이트
     per_q_score: Dict[int, float] = {}
     total_score = 0.0
     vector_success_count = 0
     vector_fail_count = 0
 
-    # 새로 추가: 카테고리별 합계 및 카운트
     category_sum: Dict[str, float] = {}
     category_count: Dict[str, int] = {}
 
@@ -480,13 +510,10 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
         for idx, item in enumerate(payload.answers, 1):
             logger.info(f"[처리 {idx}/{len(payload.answers)}] Q{item.questionNo} 시작")
 
-            # 사용자 답변 추출 (STT 우선)
             user_text = item.sttText or item.typedText or ""
 
-            # 문항 정보 가져오기
             qinfo = question_map.get(item.questionId) if item.questionId else None
 
-            # ========== AI 채점 수행 ==========
             if qinfo:
                 try:
                     score_0_1, feedback, resolved_correct = choose_scoring(
@@ -511,44 +538,16 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
 
             score_pct = score_0_1 * 100.0
 
-            # ===== 카테고리 집계 시작 =====
             qinfo = question_map.get(item.questionId) if item.questionId else None
             category_name = (qinfo.category.strip() if qinfo and qinfo.category else "UNKNOWN")
 
-            # 안전하게 카테고리 키 초기화
             if category_name not in category_sum:
                 category_sum[category_name] = 0.0
                 category_count[category_name] = 0
 
             category_sum[category_name] += score_pct
             category_count[category_name] += 1
-            # ===== 카테고리 집계 끝 =====
 
-            # ========== 임베딩 벡터 생성 (STT_TEXT가 있을 때만) ==========
-            # vector_str = None
-            # if item.sttText and item.sttText.strip():
-            #     try:
-            #         logger.info(f"[벡터 생성] Q{item.questionNo} STT_TEXT 임베딩 시작...")
-            #         embedding = generate_text_embedding(item.sttText)
-            #
-            #         if embedding:
-            #             vector_str = format_vector_for_oracle(embedding)
-            #             vector_success_count += 1
-            #             logger.info(
-            #                 f"[벡터 생성 완료] Q{item.questionNo}: "
-            #                 f"차원={len(embedding)}, 크기={len(vector_str)} bytes"
-            #             )
-            #         else:
-            #             vector_fail_count += 1
-            #             logger.warning(f"[벡터 생성 실패] Q{item.questionNo}: 임베딩 반환값 없음")
-            #
-            #     except Exception as e:
-            #         vector_fail_count += 1
-            #         logger.error(f"[벡터 생성 오류] Q{item.questionNo}: {e}", exc_info=True)
-            # else:
-            #     logger.info(f"[벡터 건너뜀] Q{item.questionNo}: STT_TEXT 없음")
-
-            # ========== DB UPDATE 수행 ==========
             existing = (
                 db.query(CognitiveAnswer)
                 .filter(
@@ -559,25 +558,15 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
             )
 
             if existing:
-                # ★ 기존 레코드 UPDATE
                 existing.question_id = item.questionId if item.questionId else existing.question_id
                 existing.stt_text = item.sttText
-                existing.typed_text = item.typedText  # 타이핑 답변도 함께 저장
+                existing.typed_text = item.typedText
                 existing.score = round(score_pct, 2)
                 existing.latency_ms = item.latencyMs
                 existing.created_at = existing.created_at or datetime.utcnow()
 
-                # ★ Vector 값 업데이트 (Oracle VECTOR 컬럼에 문자열로 저장)
-                # if vector_str:
-                #     # Oracle Vector는 문자열 형식으로 저장: '[1.0, 2.0, ...]'
-                #     existing.voice_vector = vector_str
-
-                logger.info(
-                    f"[UPDATE 완료] Q{item.questionNo} "
-                    # f"(answer_id={existing.answer_id}, 벡터={'O' if vector_str else 'X'})"
-                )
+                logger.info(f"[UPDATE 완료] Q{item.questionNo}")
             else:
-                # ★ placeholder 없으면 새로 INSERT (안전장치)
                 logger.warning(f"[INSERT] Q{item.questionNo} placeholder 없음 - 새로 생성")
 
                 ans = CognitiveAnswer(
@@ -588,16 +577,13 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
                     typed_text=item.typedText,
                     score=round(score_pct, 2),
                     latency_ms=item.latencyMs,
-                    # voice_vector=vector_str,  # 벡터 저장
                     created_at=datetime.utcnow(),
                 )
                 db.add(ans)
 
-            # 점수 집계
             per_q_score[item.questionNo] = round(score_pct, 2)
             total_score += score_pct
 
-        # ========== 모든 답변 커밋 ==========
         db.commit()
 
         logger.info(
@@ -611,7 +597,7 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
         logger.error(f"[답변 저장 오류] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"답안 저장 오류: {e}")
 
-    # ========== 4) 세션 종료 및 총점 업데이트 ==========
+    # 4) 세션 종료 및 총점 업데이트
     try:
         n = len(payload.answers)
         avg_score = total_score / n if n > 0 else 0.0
@@ -632,7 +618,7 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
         logger.error(f"[세션 업데이트 오류] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"세션 업데이트 오류: {e}")
 
-    # ========== 5) 결과 반환 (기본 구조) ==========
+    # 5) 결과 반환
     grade = _grade_from(avg_score)
     summary = f"총 {len(payload.answers)}문항 평균 {avg_score:.1f}점 → 등급 {grade}"
 
@@ -641,7 +627,6 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
         cnt = category_count.get(cat, 0)
         category_average[cat] = round((s / cnt) if cnt > 0 else 0.0, 2)
 
-    # ========== 최근 3회 세션 반환 ==========
     recent_sessions_list = []
     try:
         if getattr(session_obj, "user_id", None) is not None:
@@ -656,7 +641,6 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
                 .all()
             )
         else:
-            # fallback: 같은 세션 소유자 정보가 없으면, 전체에서 최근 3개(조심해서 사용)
             rows = (
                 db.query(CognitiveSession)
                 .filter(CognitiveSession.status == "COMPLETED")
@@ -678,7 +662,6 @@ def submit_cognitive(payload: SubmitRequest, db: Session = Depends(get_db)):
 
     logger.info(f"[제출 완료] {summary}")
 
-    # 최종 반환
     return Result(
         totalScore=round(avg_score, 1),
         categoryAverage=category_average,
