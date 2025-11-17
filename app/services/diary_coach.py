@@ -123,9 +123,7 @@ def _search_youtube_top_video(
     - fallback_category: 실패 시 사용할 대체 검색어 힌트
     반환: (title, url)
     """
-    # API 키가 없으면 YouTube 검색 대신 기본 검색 URL 반환
     if not YOUTUBE_API_KEY:
-        # 최소한 "검색 결과 페이지"라도 열리게 만들기
         q = query or (fallback_category or "relax music")
         return (
             "YouTube 검색 결과",
