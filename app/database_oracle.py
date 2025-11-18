@@ -2,30 +2,46 @@ import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+import oracledb  
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-ORACLE_USER = os.getenv("ORACLE_USER", "EDUORA001")
-ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "")
-ORACLE_HOST = os.getenv("ORACLE_HOST", "localhost")
-ORACLE_PORT = os.getenv("ORACLE_PORT", "1521")
+# ------------------ 환경 변수 읽기 ------------------
+ORACLE_USER = os.getenv("ORACLE_USER")
+ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
 
-ORACLE_SERVICE = os.getenv("ORACLE_SERVICE", os.getenv("ORACLE_SID", "free"))
+# tnsnames.ora 안에 있는 alias (team003_medium)
+ORACLE_DSN = os.getenv("ORACLE_DSN")
 
-DB_URL = (
-    f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}"
-    f"@{ORACLE_HOST}:{ORACLE_PORT}/?service_name={ORACLE_SERVICE}"
+# Instant Client & Wallet 경로
+ORACLE_INSTANT_CLIENT = os.getenv(
+    "ORACLE_INSTANT_CLIENT"
 )
+
+ORACLE_WALLET_DIR = os.getenv(
+    "ORACLE_WALLET_DIR"
+)
+
+# ------------------ Thick 모드 초기화 (한 번만!) ------------------
+# ⚠ 같은 프로세스에서 init_oracle_client는 한 번만 호출 가능
+oracledb.init_oracle_client(
+    lib_dir=ORACLE_INSTANT_CLIENT,
+    config_dir=ORACLE_WALLET_DIR,
+)
+
+# ------------------ SQLAlchemy 엔진 URL ------------------
+# ✅ 여기서는 host/port/service_name 안 쓰고, test.py와 똑같이 TNS alias만 사용
+DB_URL = f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}@{ORACLE_DSN}"
 
 _safe = DB_URL.replace(ORACLE_PASSWORD, "****") if ORACLE_PASSWORD else DB_URL
 print(f"[DB URL(check)] { _safe }")
 
 engine = create_engine(
     DB_URL,
-    thick_mode=False,
     pool_pre_ping=True,
     pool_recycle=1800,
     pool_size=5,

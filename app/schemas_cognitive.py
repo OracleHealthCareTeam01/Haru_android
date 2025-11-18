@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 class Question(BaseModel):
@@ -25,6 +25,8 @@ class SubmitRequest(BaseModel):
 
 class Result(BaseModel):
     totalScore: float
-    perQuestion: Dict[int, float]
+    # perQuestion: Dict[int, float]
+    categoryAverage: Dict[str, float]
+    recentSessions: List[Dict[str, Any]]
     summary: str
     grade: str

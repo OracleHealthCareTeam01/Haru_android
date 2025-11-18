@@ -3,10 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from .database_oracle import ping_db
 
 try:
-    from .router import cognitive
+    from .router import cognitive, diary
     HAS_COG = True
 except Exception as e:
-    print(f"Cognitive router import 실패: {e}")
+    print(f"router import 실패: {e}")
     HAS_COG = False
 
 app = FastAPI(title="HaruCoach API")
@@ -21,6 +21,7 @@ app.add_middleware(
 
 if HAS_COG:
     app.include_router(cognitive.router)
+    app.include_router(diary.router)
 
 @app.get("/health")
 def health():
